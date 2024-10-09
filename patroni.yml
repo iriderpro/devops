@@ -1,0 +1,280 @@
+---
+- hosts: databases
+  become: yes
+  become_user: root
+  become_method: su
+  tasks:
+  - name: Clear old installation
+    become: no
+    shell: |
+      if [ -d /etc/etcd ]
+      then
+        echo "Remove ETCD"
+        yum remove -y etcd
+        rm -fR /etc/etcd
+        rm -fR /var/lib/etcd
+      fi
+      if [ -d /etc/patroni ]
+      then
+        echo "Remove PATRONI"
+        yum remove -y patroni
+        rm -fR /etc/patroni
+      fi
+      if [ -d /var/lib/pgsql ]
+      then
+        echo "Remove POSTGRESQL"
+        yum remove -y postgresql
+        rm -fR /usr/pgsql-13
+        rm -fR /var/lib/pgsql
+      fi
+      if [ -d /etc/pgbouncer ]
+      then
+        echo "Remove PGBOUNCER"
+        yum remove -y pgbouncer
+        rm -fR /etc/pgbouncer
+      fi
+      if grep -Fxq 'export PGDATA="/var/lib/pgsql/13/data"' /root/.bash_profile
+      then
+        echo "Deleting old data from .bash_profile"
+        sed -i '/PGDATA/d' /root/.bash_profile >> /dev/null
+        sed -i '/ETCD/d' /root/.bash_profile >> /dev/null
+        sed -i '/PATRONI/d' /root/.bash_profile >> /dev/null
+        sed -i '/ENDPOINTS/d' /root/.bash_profile >> /dev/null
+      fi
+    ignore_errors: yes
+  - name: Stop service HaProxy
+    ansible.builtin.service:
+      name: haproxy
+      state: stopped
+    ignore_errors: yes
+  - name: Create Directories
+    file:
+      path: "{{ item }}"
+      state: directory
+      owner: root
+      group: root
+      mode: 0775
+    loop:
+      - '/etc/etcd'
+      - '/var/lib/etcd'
+      - '/var/lib/pgsql'
+      - '/var/lib/pgsql/13'
+      - '/opt/senat/distr'
+      - '/opt/senat'
+  - name: Clear old hosts
+    become: no
+    shell: |
+      sed -i '/'{{ hostvars[item].server_ip }}'/d' /etc/hosts >> /dev/null
+    with_items: "{{ groups['databases'] }}"
+    ignore_errors: yes
+  - name: Add servers to hosts file
+    ansible.builtin.lineinfile:
+      path: /etc/hosts
+      line: "{{ hostvars[item].server_ip }}  {{ hostvars[item].server_name }}"
+      create: yes  
+    with_items: "{{ groups['databases'] }}"
+  - name: Disabling SELINUX
+    ansible.builtin.lineinfile:
+      path: /etc/selinux/config
+      search_string: 'SELINUX=enforcing'
+      line: SELINUX=disabled
+      owner: root
+      group: root
+      mode: '0644'
+    ignore_errors: yes
+  - name: Disabling SELINUX
+    ansible.builtin.shell: setenforce 0
+    ignore_errors: yes
+  - name: Stop firewall
+    ansible.builtin.service:
+      name: firewalld
+      state: stopped
+  - name: Disable firewall
+    ansible.builtin.service:
+      name: firewalld
+      enabled: false
+  - name: Download PostgreSQL rpm from repo
+    ansible.builtin.get_url:
+      url: https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+      dest: /opt/senat/distr/pgdg-redhat-repo-latest.noarch.rpm
+      mode: '0440'
+  - name:  Install PostgreSql repo
+    ansible.builtin.shell: dnf -y install https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+  - name: Enabling pgdg13
+    ansible.builtin.shell: dnf config-manager --enable pgdg13
+    ignore_errors: yes
+  - name: Disable postgresql module
+    ansible.builtin.shell: dnf module disable -y postgresql
+  - name: Install PostgreSQL
+    ansible.builtin.shell: dnf -y install postgresql13-server postgresql13 postgresql13-devel postgresql13-contrib --nobest
+  - name: Setup postgresql link
+    ansible.builtin.shell: ln -s /usr/pgsql-13/bin/* /usr/sbin/
+    ignore_errors: yes
+  - name: Configuring ETCD repo
+    template: 
+      src: etcd/etcd.repo.j2
+      dest: /etc/yum.repos.d/etcd.repo
+  - name: DNF MakeCache
+    ansible.builtin.shell: dnf -y makecache
+  - name: Install ETCD
+    ansible.builtin.dnf:
+      name:
+        - etcd
+      state: latest
+  - name: Install Python
+    ansible.builtin.shell: dnf -y install python3 python3-devel python3-pip gcc libpq-devel --nobest
+  - name: Configure Python
+    ansible.builtin.shell: pip3 install --upgrade testresources --upgrade setuptools psycopg2 python-etcd
+  - name: Configure Python certifi
+    ansible.builtin.shell: python3 -m pip install certifi
+  - name: Install Patroni
+    ansible.builtin.shell: dnf -y install patroni patroni-etcd watchdog --skip-broken
+  - name: Install PgBouncer
+    ansible.builtin.dnf:
+      name:
+        - pgbouncer
+      state: latest
+  - name: Configuring ETCD
+    template: 
+      src: etcd/etcd.conf.j2
+      dest: /etc/etcd/etcd.conf
+  - name: Add ETCD variables to bash_profile
+    ansible.builtin.lineinfile:
+      path: /root/.bash_profile
+      line: export PGDATA="/var/lib/pgsql/13/data"
+      create: yes
+  - name: Add ETCD variables to bash_profile
+    ansible.builtin.lineinfile:
+      path: /root/.bash_profile
+      line: export ETCD_API="3"
+      create: yes
+  - name: Add ETCD variables to bash_profile
+    ansible.builtin.lineinfile:
+      path: /root/.bash_profile
+      line: export PATRONI_ETCD_URL="http://127.0.0.1:2379"
+      create: yes
+  - name: Add ETCD variables to bash_profile
+    ansible.builtin.lineinfile:
+      path: /root/.bash_profile
+      line: export PATRONI_SCOPE="pg_cluster"
+      create: yes
+  - name: Add ETCD variables to bash_profile
+    ansible.builtin.lineinfile:
+      path: /root/.bash_profile
+      line: ENDPOINTS= {{ etcd_endpoints }}
+      create: yes      
+  - name: Start service etcd
+    ansible.builtin.service:
+      name: etcd
+      state: started
+  - name: Enable service etcd
+    ansible.builtin.service:
+      name: etcd
+      enabled: yes    
+  - name: Configuring Patroni
+    template: 
+      src: patroni/patroni.yml.j2
+      dest: /etc/patroni/patroni.yml      
+  - name: Start service Patroni
+    ansible.builtin.service:
+      name: patroni
+      state: started      
+  - name: Enable service Patroni
+    ansible.builtin.service:
+      name: patroni
+      enabled: yes     
+  - name: Waiting 30 seconds for PATRONI SYNC
+    ansible.builtin.pause:
+      seconds: 30       
+  - name: Finding patroni cluster leader
+    become: no
+    shell: |
+      clusterLeaderData='>>>'$(patronictl -c /etc/patroni/patroni.yml list | awk ' /Leader/{print $2}')
+      clusterLeaderArray=(${clusterLeaderData//>>>/ })
+      clusterLeader=${clusterLeaderArray[0]}
+      echo $clusterLeader
+    register: cluster_leader
+    ignore_errors: yes
+  - name: Show patroni cluster leader 
+    ansible.builtin.debug:
+      msg: "I FOUND CLUSTER LEADER IS: [{{ cluster_leader['stdout_lines'][0] }}]"
+    ignore_errors: yes
+  - name: Configuring Database For Senat
+    become: no
+    shell: |
+      psql postgresql://postgres:postgres@localhost:5432 --no-align --quiet --tuples-only -c 'CREATE DATABASE senat;'
+      psql postgresql://postgres:postgres@localhost:5432 --no-align --quiet --tuples-only -c "CREATE USER {{ db_user }} WITH PASSWORD '{{ db_password }}';"
+      psql postgresql://postgres:postgres@localhost:5432/senat --no-align --quiet --tuples-only -c 'GRANT ALL PRIVILEGES ON DATABASE senat TO {{ db_user }};'
+      psql postgresql://postgres:postgres@localhost:5432/senat --no-align --quiet --tuples-only -c 'ALTER DATABASE senat OWNER TO {{ db_user }};'
+      psql postgresql://postgres:postgres@localhost:5432/senat --no-align --quiet --tuples-only -c "CREATE ROLE pgbouncer WITH LOGIN ENCRYPTED PASSWORD '{{ db_password }}';"
+      psql postgresql://postgres:postgres@localhost:5432/senat --no-align --quiet --tuples-only -c "CREATE FUNCTION public.lookup (INOUT p_user name, OUT p_password text) RETURNS record LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS \$\$SELECT usename, passwd FROM pg_shadow WHERE usename = p_user \$\$;"
+      psql postgresql://postgres:postgres@localhost:5432/senat --no-align --quiet --tuples-only -c 'CREATE EXTENSION "uuid-ossp";'
+    when: cluster_leader['stdout_lines'][0] == server_name
+    ignore_errors: yes
+  - name: Backup old PGBOUNCER userlist
+    ansible.builtin.shell: |
+      if [ -f /etc/pgbouncer/userlist.txt ]
+      then
+        echo "Backup old PGBOUNCER userlist"
+        mv /etc/pgbouncer/userlist.txt /etc/pgbouncer/userlist.txt_orig
+      fi
+    ignore_errors: yes
+  - name: Configure PGBOUNCER userlist
+    ansible.builtin.lineinfile:
+      path: /etc/pgbouncer/userlist.txt
+      line: "\"pgbouncer\" \"{{ pgbouncer_password }}\""
+      create: yes 
+  - name: Configure PGBOUNCER
+    template: 
+      src: pgbouncer/pgbouncer.ini.j2
+      dest: /etc/pgbouncer/pgbouncer.ini
+  - name: Waiting 30 seconds for DB cluster SYNC
+    ansible.builtin.pause:
+      seconds: 30
+  - name: Start service PGBOUNCER
+    ansible.builtin.service:
+      name: pgbouncer
+      state: started      
+  - name: Enable service PGBOUNCER
+    ansible.builtin.service:
+      name: pgbouncer
+      enabled: yes
+  - name: Start service HaProxy
+    ansible.builtin.service:
+      name: haproxy
+      state: started    
+#  - name: Install HaPxohy
+#    ansible.builtin.shell: dnf -y install haproxy
+#  - name: Configuring HaProxy
+#    template: 
+#      src: haproxy/haproxy.cfg.j2
+#      dest: /etc/haproxy/haproxy.cfg
+#  - name: Add Primary servers to HaProxy config
+#    ansible.builtin.lineinfile:
+#      path: /etc/haproxy/haproxy.cfg
+#      line: "server {{ hostvars[item].server_name }} {{ hostvars[item].server_ip }}:6432 maxconn 100 check port 8008"
+#      create: yes  
+#    with_items: "{{ groups['databases'] }}"
+#  - name: Configuring Secondaty server to HaProxy
+#    ansible.builtin.lineinfile:
+#      path: /etc/haproxy/haproxy.cfg
+#      line: |
+#       listen standby
+#	     bind *:5001
+#	     option httpchk
+#	     http-check expect status 503
+#      create: no
+#  - name: Add Secondaty servers to HaProxy config
+#    ansible.builtin.lineinfile:
+#      path: /etc/haproxy/haproxy.cfg
+#      line: "server {{ hostvars[item].server_name }} {{ hostvars[item].server_ip }}:6432 maxconn 100 check port 8008"
+#      create: yes  
+#    with_items: "{{ groups['databases'] }}"
+#  - name: Start service HaProxy
+#    ansible.builtin.service:
+#      name: haproxy
+#      state: started      
+#  - name: Enable service HaProxy
+#    ansible.builtin.service:
+#      name: haproxy
+#      enabled: yes  
