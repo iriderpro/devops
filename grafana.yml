@@ -1,0 +1,67 @@
+---
+- hosts: grafana
+  become: yes
+  become_user: root
+  become_method: su
+  tasks:
+  - name: Create Directories
+    file:
+      path: "{{ item }}"
+      state: directory
+      owner: root
+      group: root
+      mode: 0775
+    loop:
+      - '/opt/senat'
+      - '/opt/senat/distr'
+      - '/opt/senat/service'
+      - '/opt/senat/service/grafana'
+      - '/opt/senat/logs'
+      - '/opt/senat/logs/service'
+  - name: Disabling SELINUX
+    ansible.builtin.lineinfile:
+      path: /etc/selinux/config
+      search_string: 'SELINUX=enforcing'
+      line: SELINUX=disabled
+      owner: root
+      group: root
+      mode: '0644'
+  - name: Add servers to hosts file
+    ansible.builtin.lineinfile:
+      path: /etc/hosts
+      line: "{{ hostvars[item].server_ip }}  {{ hostvars[item].server_name }}"
+      create: yes  
+    with_items: "{{ groups['opensearch'] }}"
+  - name: Disabling SELINUX
+    ansible.builtin.shell: setenforce 0
+  - name: Stop firewall
+    ansible.builtin.service:
+      name: firewalld
+      state: stopped
+  - name: Disable firewall
+    ansible.builtin.service:
+      name: firewalld
+      enabled: false
+  - name: Download Grafana
+    ansible.builtin.get_url:
+      url: https://dl.grafana.com/oss/release/grafana-9.5.5.linux-amd64.tar.gz
+      dest: /opt/senat/distr/grafana-9.5.5.linux-amd64.tar.gz
+      mode: '0440'
+  - name:  Unpacking Grafana
+    ansible.builtin.shell: cd /opt/senat/distr/ && tar -xzvf grafana-9.5.5.linux-amd64.tar.gz
+  - name:  Move Grafana to target Directory
+    ansible.builtin.shell: cd /opt/senat/distr/ && cp -r grafana-9.5.5/* /opt/senat/service/grafana 
+  - name:  Allow Grafana binary to tart
+    ansible.builtin.shell: chmod +x /opt/senat/service/grafana/bin/grafana-server
+  - name: Create Service for Grafana
+    template: 
+      src: grafana/grafana.service.j2
+      dest: /usr/lib/systemd/system/grafana.service
+  - name: Start Grafana
+    ansible.builtin.service:
+      name: grafana
+      state: started       
+  - name: Enable service Grafana
+    ansible.builtin.service:
+      name: grafana
+      enabled: yes 
