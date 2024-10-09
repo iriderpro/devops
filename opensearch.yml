@@ -1,0 +1,141 @@
+---
+- hosts: opensearch
+  become: yes
+  become_user: root
+  become_method: su
+  tasks:
+  - name: Create Directories
+    file:
+      path: "{{ item }}"
+      state: directory
+      owner: root
+      group: root
+      mode: 0775
+    loop:
+      - '/opt/senat/distr'
+      - '/opt/senat'
+  - name: Disabling SELINUX
+    ansible.builtin.lineinfile:
+      path: /etc/selinux/config
+      search_string: 'SELINUX=enforcing'
+      line: SELINUX=disabled
+      owner: root
+      group: root
+      mode: '0644'
+    ignore_errors: yes
+  - name: Add servers to hosts file
+    ansible.builtin.lineinfile:
+      path: /etc/hosts
+      line: "{{ hostvars[item].server_ip }}  {{ hostvars[item].server_name }}"
+      create: yes  
+    with_items: "{{ groups['opensearch'] }}"
+  - name: Disabling SELINUX
+    ansible.builtin.shell: setenforce 0
+    ignore_errors: yes
+  - name: Stop firewall
+    ansible.builtin.service:
+      name: firewalld
+      state: stopped
+  - name: Disable firewall
+    ansible.builtin.service:
+      name: firewalld
+      enabled: false
+  - name: Install JAVA
+ #   ansible.builtin.shell: dnf -y install java-17-openjdk
+    yum:
+      name: java-17-openjdk
+      state: present
+  - name: Download Opensearch 2.10.0
+    ansible.builtin.get_url:
+      url: https://api.sigitov.su/distr/opensearch-2.10.0-linux-x64.rpm
+      dest: /opt/senat/distr/opensearch-2.10.0-linux-x64.rpm
+      mode: '0440'
+  - name:  Install Opensearch from rpm
+    ansible.builtin.shell: dnf install -y /opt/senat/distr/opensearch-2.10.0-linux-x64.rpm
+    #yum:
+    #  name: 
+    #  - /opt/senat/distr/opensearch-2.10.0-linux-x64.rpm
+    #  state: present
+  - name: Download Opensearch Dashboards 2.10.0
+    ansible.builtin.get_url:
+      url: https://api.sigitov.su/distr/opensearch-dashboards-2.10.0-linux-x64.rpm
+      dest: /opt/senat/distr/opensearch-dashboards-2.10.0-linux-x64.rpm
+      mode: '0440'
+    when: hostvars[inventory_hostname].cluster_leader == "true"
+  - name:  Install Opensearch Dashboards from rpm
+    ansible.builtin.shell: dnf install -y /opt/senat/distr/opensearch-dashboards-2.10.0-linux-x64.rpm
+    #yum:
+    #  name: 
+    #  - /opt/senat/distr/opensearch-2.10.0-linux-x64.rpm
+    #  state: present
+    when: hostvars[inventory_hostname].cluster_leader == "true"
+  - name: First start Opensearch
+    ansible.builtin.service:
+      name: opensearch
+      state: started 
+  - name: OpenSearch Init Security Config
+    ansible.builtin.shell: /usr/share/opensearch/plugins/opensearch-security/tools/securityadmin.sh -cd /etc/opensearch/opensearch-security -icl -nhnv -cacert /etc/opensearch/root-ca.pem -cert /etc/opensearch/kirk.pem -key /etc/opensearch/kirk-key.pem
+  - name: Stop Opensearch
+    ansible.builtin.service:
+      name: opensearch
+      state: stopped
+  - name: Configuring OpenSearch
+    become: no
+    shell: |
+      sed -i 's/#network.host: 192.168.0.1/network.host: 0.0.0.0/g' /etc/opensearch/opensearch.yml
+      sed -i 's/#http.port: 9200/http.port: 9200/g' /etc/opensearch/opensearch.yml
+      sed -i '/network.bind_host:/d' /etc/opensearch/opensearch.yml >> /dev/null
+      sed -i '/network.host/i network.bind_host: '{{ server_ip }} /etc/opensearch/opensearch.yml
+      sed -i '/node.roles:/d' /etc/opensearch/opensearch.yml >> /dev/null
+      sed -i '/node.name/i node.roles: \[ {{ node_roles }} \]' /etc/opensearch/opensearch.yml
+      sed -i 's/#cluster.initial_cluster_manager_nodes: \["node-1", "node-2"\]/cluster.initial_cluster_manager_nodes: \["{{ initial_cluster_manager_nodes }}"\]/g' /etc/opensearch/opensearch.yml
+  - name: Start Opensearch after config
+    ansible.builtin.service:
+      name: opensearch
+      state: started      
+  - name: Enable service Opensearch
+    ansible.builtin.service:
+      name: opensearch
+      enabled: yes  
+  - name: Tuning OpenSearch
+    become: no
+    shell: |
+      curl -X PUT https://{{ server_ip }}:9200/_cluster/settings -H "Content-Type: application/json" -d '{ "persistent": { "cluster.max_shards_per_node": "50000" } }' -u 'admin:admin' --insecure
+      curl -X PUT https://{{ server_ip }}:9200/_cluster/settings -H "Content-Type: application/json" -d '{ "persistent": { "compatibility": {"override_main_response_version": true } } }' -u 'admin:admin' --insecure
+      curl -X PUT https://{{ server_ip }}:9200/_ingest/pipeline/attachment -H "Content-Type: application/json" -d '{ "description": "Extract attachment information", "processors": [{"attachment":{"field":"data","target_field":"attachment","indexed_chars": -1},"remove":{"field":"data"}}]}' -u 'admin:admin' --insecure
+    ignore_errors: yes
+  - name: Backup Opensearch Dashboards config
+    become: no
+    ansible.builtin.shell: mv /etc/opensearch-dashboards/opensearch_dashboards.yml /etc/opensearch-dashboards/opensearch_dashboards.yml_orig
+    ignore_errors: yes
+    when: hostvars[inventory_hostname].cluster_leader == "true"
+  - name: Create new Opensearch Dashboards config
+    become: no
+    ansible.builtin.shell: touch /etc/opensearch-dashboards/opensearch_dashboards.yml
+    ignore_errors: yes
+    when: hostvars[inventory_hostname].cluster_leader == "true"
+  - name: Configuring Opensearch Dashboards
+    become: no
+    shell: |
+      echo -e 'server.host: '{{ server_ip }} >> /etc/opensearch-dashboards/opensearch_dashboards.yml
+      echo -e 'server.ssl.enabled: false' >> /etc/opensearch-dashboards/opensearch_dashboards.yml
+      echo -e 'opensearch.hosts: [https://'{{ server_ip }}':9200]' >> /etc/opensearch-dashboards/opensearch_dashboards.yml
+      echo -e 'opensearch.ssl.verificationMode: none' >> /etc/opensearch-dashboards/opensearch_dashboards.yml
+      echo -e 'opensearch.username: admin' >> /etc/opensearch-dashboards/opensearch_dashboards.yml
+      echo -e 'opensearch.password: admin' >> /etc/opensearch-dashboards/opensearch_dashboards.yml
+      echo -e 'opensearch.requestHeadersWhitelist: [authorization, securitytenant]' >> /etc/opensearch-dashboards/opensearch_dashboards.yml
+      echo -e 'opensearch_security.multitenancy.enabled: true' >> /etc/opensearch-dashboards/opensearch_dashboards.yml
+      echo -e 'opensearch_security.multitenancy.tenants.preferred: [Private, Global]' >> /etc/opensearch-dashboards/opensearch_dashboards.yml
+      echo -e 'opensearch_security.readonly_mode.roles: [kibana_read_only]' >> /etc/opensearch-dashboards/opensearch_dashboards.yml
+    when: hostvars[inventory_hostname].cluster_leader == "true"
+  - name: Start OpenSearch Dashboards
+    ansible.builtin.service:
+      name: opensearch-dashboards
+      state: started     
+    when: hostvars[inventory_hostname].cluster_leader == "true"    
+  - name: Enable service OpenSearch Dashboards
+    ansible.builtin.service:
+      name: opensearch-dashboards
+      enabled: yes
+    when: hostvars[inventory_hostname].cluster_leader == "true"
+      
